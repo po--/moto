@@ -59,6 +59,19 @@ def test_upload_server_cert():
 
 
 @mock_iam_deprecated()
+def test_delete_server_cert():
+    conn = boto.connect_iam()
+
+    conn.upload_server_cert("certname", "certbody", "privatekey")
+    conn.get_server_certificate("certname")
+    conn.delete_server_cert("certname")
+    with assert_raises(BotoServerError):
+        conn.get_server_certificate("certname")
+    with assert_raises(BotoServerError):
+        conn.delete_server_cert("certname")
+
+
+@mock_iam_deprecated()
 @raises(BotoServerError)
 def test_get_role__should_throw__when_role_does_not_exist():
     conn = boto.connect_iam()
@@ -638,3 +651,21 @@ def test_attach_detach_user_policy():
 
     resp = client.list_attached_user_policies(UserName=user.name)
     resp['AttachedPolicies'].should.have.length_of(0)
+
+
+@mock_iam
+def test_update_access_key():
+    iam = boto3.resource('iam', region_name='us-east-1')
+    client = iam.meta.client
+    username = 'test-user'
+    iam.create_user(UserName=username)
+    with assert_raises(ClientError):
+        client.update_access_key(UserName=username,
+                                 AccessKeyId='non-existent-key',
+                                 Status='Inactive')
+    key = client.create_access_key(UserName=username)['AccessKey']
+    client.update_access_key(UserName=username,
+                             AccessKeyId=key['AccessKeyId'],
+                             Status='Inactive')
+    resp = client.list_access_keys(UserName=username)
+    resp['AccessKeyMetadata'][0]['Status'].should.equal('Inactive')

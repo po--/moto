@@ -3,7 +3,7 @@ import logging
 # logging.getLogger('boto').setLevel(logging.CRITICAL)
 
 __title__ = 'moto'
-__version__ = '1.0.1'
+__version__ = '1.2.0',
 
 from .acm import mock_acm  # flake8: noqa
 from .apigateway import mock_apigateway, mock_apigateway_deprecated  # flake8: noqa
@@ -41,6 +41,9 @@ from .swf import mock_swf, mock_swf_deprecated  # flake8: noqa
 from .xray import mock_xray, mock_xray_client, XRaySegment  # flake8: noqa
 from .logs import mock_logs, mock_logs_deprecated # flake8: noqa
 from .batch import mock_batch  # flake8: noqa
+from .resourcegroupstaggingapi import mock_resourcegroupstaggingapi  # flake8: noqa
+from .iot import mock_iot  # flake8: noqa
+from .iotdata import mock_iotdata  # flake8: noqa
 
 
 try:

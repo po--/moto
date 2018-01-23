@@ -7,6 +7,8 @@ import json
 import os
 import re
 import six
+import warnings
+from pkg_resources import resource_filename
 
 import boto.ec2
 
@@ -45,8 +47,8 @@ from .exceptions import (
     InvalidRouteTableIdError,
     InvalidRouteError,
     InvalidInstanceIdError,
-    MalformedAMIIdError,
     InvalidAMIIdError,
+    MalformedAMIIdError,
     InvalidAMIAttributeItemValueError,
     InvalidSnapshotIdError,
     InvalidVolumeIdError,
@@ -113,8 +115,13 @@ from .utils import (
     tag_filter_matches,
 )
 
-RESOURCES_DIR = os.path.join(os.path.dirname(__file__), 'resources')
-INSTANCE_TYPES = json.load(open(os.path.join(RESOURCES_DIR, 'instance_types.json'), 'r'))
+INSTANCE_TYPES = json.load(
+    open(resource_filename(__name__, 'resources/instance_types.json'), 'r')
+)
+AMIS = json.load(
+    open(os.environ.get('MOTO_AMIS_PATH') or resource_filename(
+         __name__, 'resources/amis.json'), 'r')
+)
 
 
 def utc_date_and_time():
@@ -373,6 +380,7 @@ class Instance(TaggedEC2Resource, BotoInstance):
         self.subnet_id = kwargs.get("subnet_id")
         in_ec2_classic = not bool(self.subnet_id)
         self.key_name = kwargs.get("key_name")
+        self.ebs_optimized = kwargs.get("ebs_optimized", False)
         self.source_dest_check = "true"
         self.launch_time = utc_date_and_time()
         self.disable_api_termination = kwargs.get("disable_api_termination", False)
@@ -384,6 +392,13 @@ class Instance(TaggedEC2Resource, BotoInstance):
 
         amis = self.ec2_backend.describe_images(filters={'image-id': image_id})
         ami = amis[0] if amis else None
+        if ami is None:
+            warnings.warn('Could not find AMI with image-id:{0}, '
+                          'in the near future this will '
+                          'cause an error.\n'
+                          'Use ec2_backend.describe_images() to'
+                          'find suitable image for your test'.format(image_id),
+                          PendingDeprecationWarning)
 
         self.platform = ami.platform if ami else None
         self.virtualization_type = ami.virtualization_type if ami else 'paravirtual'
@@ -494,6 +509,22 @@ class Instance(TaggedEC2Resource, BotoInstance):
         for tag in properties.get("Tags", []):
             instance.add_tag(tag["Key"], tag["Value"])
         return instance
+
+    @classmethod
+    def delete_from_cloudformation_json(cls, resource_name, cloudformation_json, region_name):
+        ec2_backend = ec2_backends[region_name]
+        all_instances = ec2_backend.all_instances()
+
+        # the resource_name for instances is the stack name, logical id, and random suffix separated
+        # by hyphens.  So to lookup the instances using the 'aws:cloudformation:logical-id' tag, we need to
+        # extract the logical-id from the resource_name
+        logical_id = resource_name.split('-')[1]
+
+        for instance in all_instances:
+            instance_tags = instance.get_tags()
+            for tag in instance_tags:
+                if tag['key'] == 'aws:cloudformation:logical-id' and tag['value'] == logical_id:
+                    instance.delete(region_name)
 
     @property
     def physical_resource_id(self):
@@ -1001,17 +1032,30 @@ class TagBackend(object):
 
 class Ami(TaggedEC2Resource):
     def __init__(self, ec2_backend, ami_id, instance=None, source_ami=None,
-                 name=None, description=None):
+                 name=None, description=None, owner_id=None,
+                 public=False, virtualization_type=None, architecture=None,
+                 state='available', creation_date=None, platform=None,
+                 image_type='machine', image_location=None, hypervisor=None,
+                 root_device_type=None, root_device_name=None, sriov='simple',
+                 region_name='us-east-1a'
+                 ):
         self.ec2_backend = ec2_backend
         self.id = ami_id
-        self.state = "available"
+        self.state = state
         self.name = name
+        self.image_type = image_type
+        self.image_location = image_location
+        self.owner_id = owner_id
         self.description = description
-        self.virtualization_type = None
-        self.architecture = None
+        self.virtualization_type = virtualization_type
+        self.architecture = architecture
         self.kernel_id = None
-        self.platform = None
-        self.creation_date = utc_date_and_time()
+        self.platform = platform
+        self.hypervisor = hypervisor
+        self.root_device_name = root_device_name
+        self.root_device_type = root_device_type
+        self.sriov = sriov
+        self.creation_date = utc_date_and_time() if creation_date is None else creation_date
 
         if instance:
             self.instance = instance
@@ -1039,8 +1083,11 @@ class Ami(TaggedEC2Resource):
         self.launch_permission_groups = set()
         self.launch_permission_users = set()
 
+        if public:
+            self.launch_permission_groups.add('all')
+
         # AWS auto-creates these, we should reflect the same.
-        volume = self.ec2_backend.create_volume(15, "us-east-1a")
+        volume = self.ec2_backend.create_volume(15, region_name)
         self.ebs_snapshot = self.ec2_backend.create_snapshot(
             volume.id, "Auto-created snapshot for AMI %s" % self.id)
 
@@ -1067,22 +1114,37 @@ class Ami(TaggedEC2Resource):
             return self.state
         elif filter_name == 'name':
             return self.name
+        elif filter_name == 'owner-id':
+            return self.owner_id
         else:
             return super(Ami, self).get_filter_value(
                 filter_name, 'DescribeImages')
 
 
 class AmiBackend(object):
+
+    AMI_REGEX = re.compile("ami-[a-z0-9]+")
+
     def __init__(self):
         self.amis = {}
+
+        self._load_amis()
+
         super(AmiBackend, self).__init__()
 
-    def create_image(self, instance_id, name=None, description=None):
+    def _load_amis(self):
+        for ami in AMIS:
+            ami_id = ami['ami_id']
+            self.amis[ami_id] = Ami(self, **ami)
+
+    def create_image(self, instance_id, name=None, description=None,
+                     context=None):
         # TODO: check that instance exists and pull info from it.
         ami_id = random_ami_id()
         instance = self.get_instance(instance_id)
         ami = Ami(self, ami_id, instance=instance, source_ami=None,
-                  name=name, description=description)
+                  name=name, description=description,
+                  owner_id=context.get_current_user() if context else None)
         self.amis[ami_id] = ami
         return ami
 
@@ -1095,30 +1157,41 @@ class AmiBackend(object):
         self.amis[ami_id] = ami
         return ami
 
-    def describe_images(self, ami_ids=(), filters=None, exec_users=None):
-        images = []
+    def describe_images(self, ami_ids=(), filters=None, exec_users=None, owners=None,
+                        context=None):
+        images = self.amis.values()
+
+        # Limit images by launch permissions
         if exec_users:
-            for ami_id in self.amis:
-                found = False
+            tmp_images = []
+            for ami in images:
                 for user_id in exec_users:
-                    if user_id in self.amis[ami_id].launch_permission_users:
-                        found = True
-                if found:
-                    images.append(self.amis[ami_id])
-            if images == []:
-                return images
+                    if user_id in ami.launch_permission_users:
+                        tmp_images.append(ami)
+            images = tmp_images
+
+        # Limit by owner ids
+        if owners:
+            # support filtering by Owners=['self']
+            owners = list(map(
+                lambda o: context.get_current_user()
+                if context and o == 'self' else o,
+                owners))
+            images = [ami for ami in images if ami.owner_id in owners]
+
+        if ami_ids:
+            images = [ami for ami in images if ami.id in ami_ids]
+            if len(ami_ids) > len(images):
+                unknown_ids = set(ami_ids) - set(images)
+                for id in unknown_ids:
+                    if not self.AMI_REGEX.match(id):
+                        raise MalformedAMIIdError(id)
+                raise InvalidAMIIdError(unknown_ids)
+
+        # Generic filters
         if filters:
-            images = images or self.amis.values()
             return generic_filter(filters, images)
-        else:
-            for ami_id in ami_ids:
-                if ami_id in self.amis:
-                    images.append(self.amis[ami_id])
-                elif not ami_id.startswith("ami-"):
-                    raise MalformedAMIIdError(ami_id)
-                else:
-                    raise InvalidAMIIdError(ami_id)
-            return images or self.amis.values()
+        return images
 
     def deregister_image(self, ami_id):
         if ami_id in self.amis:
@@ -1195,8 +1268,15 @@ class RegionsAndZonesBackend(object):
         (region, [Zone(region + c, region) for c in 'abc'])
         for region in [r.name for r in regions])
 
-    def describe_regions(self):
-        return self.regions
+    def describe_regions(self, region_names=[]):
+        if len(region_names) == 0:
+            return self.regions
+        ret = []
+        for name in region_names:
+            for region in self.regions:
+                if region.name == name:
+                    ret.append(region)
+        return ret
 
     def describe_availability_zones(self):
         return self.zones[self.region_name]
@@ -1938,6 +2018,11 @@ class VPC(TaggedEC2Resource):
             cidr_block=properties['CidrBlock'],
             instance_tenancy=properties.get('InstanceTenancy', 'default')
         )
+        for tag in properties.get("Tags", []):
+            tag_key = tag["Key"]
+            tag_value = tag["Value"]
+            vpc.add_tag(tag_key, tag_value)
+
         return vpc
 
     @property
@@ -3666,6 +3751,7 @@ class NatGateway(object):
 class NatGatewayBackend(object):
     def __init__(self):
         self.nat_gateways = {}
+        super(NatGatewayBackend, self).__init__()
 
     def get_all_nat_gateways(self, filters):
         return self.nat_gateways.values()
@@ -3679,8 +3765,8 @@ class NatGatewayBackend(object):
         return self.nat_gateways.pop(nat_gateway_id)
 
 
-class EC2Backend(BaseBackend, InstanceBackend, TagBackend, AmiBackend,
-                 RegionsAndZonesBackend, SecurityGroupBackend, EBSBackend,
+class EC2Backend(BaseBackend, InstanceBackend, TagBackend, EBSBackend,
+                 RegionsAndZonesBackend, SecurityGroupBackend, AmiBackend,
                  VPCBackend, SubnetBackend, SubnetRouteTableAssociationBackend,
                  NetworkInterfaceBackend, VPNConnectionBackend,
                  VPCPeeringConnectionBackend,

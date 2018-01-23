@@ -271,6 +271,12 @@ class IamResponse(BaseResponse):
         template = self.response_template(GET_SERVER_CERTIFICATE_TEMPLATE)
         return template.render(certificate=cert)
 
+    def delete_server_certificate(self):
+        cert_name = self._get_param('ServerCertificateName')
+        iam_backend.delete_server_certificate(cert_name)
+        template = self.response_template(GENERIC_EMPTY_TEMPLATE)
+        return template.render(name="DeleteServerCertificate")
+
     def create_group(self):
         group_name = self._get_param('GroupName')
         path = self._get_param('Path')
@@ -433,6 +439,14 @@ class IamResponse(BaseResponse):
         key = iam_backend.create_access_key(user_name)
         template = self.response_template(CREATE_ACCESS_KEY_TEMPLATE)
         return template.render(key=key)
+
+    def update_access_key(self):
+        user_name = self._get_param('UserName')
+        access_key_id = self._get_param('AccessKeyId')
+        status = self._get_param('Status')
+        iam_backend.update_access_key(user_name, access_key_id, status)
+        template = self.response_template(GENERIC_EMPTY_TEMPLATE)
+        return template.render(name='UpdateAccessKey')
 
     def list_access_keys(self):
         user_name = self._get_param('UserName')

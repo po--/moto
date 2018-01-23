@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 from __future__ import unicode_literals
 
 import datetime
@@ -51,6 +50,7 @@ def reduced_min_part_size(f):
             return f(*args, **kwargs)
         finally:
             s3model.UPLOAD_PART_MIN_SIZE = orig_size
+
     return wrapped
 
 
@@ -884,10 +884,11 @@ def test_s3_object_in_public_bucket():
         s3_anonymous.Object(key='file.txt', bucket_name='test-bucket').get()
     exc.exception.response['Error']['Code'].should.equal('403')
 
-    params = {'Bucket': 'test-bucket','Key': 'file.txt'}
+    params = {'Bucket': 'test-bucket', 'Key': 'file.txt'}
     presigned_url = boto3.client('s3').generate_presigned_url('get_object', params, ExpiresIn=900)
     response = requests.get(presigned_url)
     assert response.status_code == 200
+
 
 @mock_s3
 def test_s3_object_in_private_bucket():
@@ -1103,6 +1104,7 @@ def test_boto3_key_etag():
     resp = s3.get_object(Bucket='mybucket', Key='steve')
     resp['ETag'].should.equal('"d32bda93738f7e03adb22e66c90fbc04"')
 
+
 @mock_s3
 def test_website_redirect_location():
     s3 = boto3.client('s3', region_name='us-east-1')
@@ -1116,6 +1118,7 @@ def test_website_redirect_location():
     s3.put_object(Bucket='mybucket', Key='steve', Body=b'is awesome', WebsiteRedirectLocation=url)
     resp = s3.get_object(Bucket='mybucket', Key='steve')
     resp['WebsiteRedirectLocation'].should.equal(url)
+
 
 @mock_s3
 def test_boto3_list_keys_xml_escaped():
@@ -1628,7 +1631,7 @@ def test_boto3_put_bucket_cors():
         })
     e = err.exception
     e.response["Error"]["Code"].should.equal("InvalidRequest")
-    e.response["Error"]["Message"].should.equal("Found unsupported HTTP method in CORS config. " 
+    e.response["Error"]["Message"].should.equal("Found unsupported HTTP method in CORS config. "
                                                 "Unsupported method is NOTREAL")
 
     with assert_raises(ClientError) as err:
@@ -1734,6 +1737,249 @@ def test_boto3_delete_bucket_cors():
 
 
 @mock_s3
+def test_put_bucket_acl_body():
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="bucket")
+    bucket_owner = s3.get_bucket_acl(Bucket="bucket")["Owner"]
+    s3.put_bucket_acl(Bucket="bucket", AccessControlPolicy={
+        "Grants": [
+            {
+                "Grantee": {
+                    "URI": "http://acs.amazonaws.com/groups/s3/LogDelivery",
+                    "Type": "Group"
+                },
+                "Permission": "WRITE"
+            },
+            {
+                "Grantee": {
+                    "URI": "http://acs.amazonaws.com/groups/s3/LogDelivery",
+                    "Type": "Group"
+                },
+                "Permission": "READ_ACP"
+            }
+        ],
+        "Owner": bucket_owner
+    })
+
+    result = s3.get_bucket_acl(Bucket="bucket")
+    assert len(result["Grants"]) == 2
+    for g in result["Grants"]:
+        assert g["Grantee"]["URI"] == "http://acs.amazonaws.com/groups/s3/LogDelivery"
+        assert g["Grantee"]["Type"] == "Group"
+        assert g["Permission"] in ["WRITE", "READ_ACP"]
+
+    # With one:
+    s3.put_bucket_acl(Bucket="bucket", AccessControlPolicy={
+        "Grants": [
+            {
+                "Grantee": {
+                    "URI": "http://acs.amazonaws.com/groups/s3/LogDelivery",
+                    "Type": "Group"
+                },
+                "Permission": "WRITE"
+            }
+        ],
+        "Owner": bucket_owner
+    })
+    result = s3.get_bucket_acl(Bucket="bucket")
+    assert len(result["Grants"]) == 1
+
+    # With no owner:
+    with assert_raises(ClientError) as err:
+        s3.put_bucket_acl(Bucket="bucket", AccessControlPolicy={
+            "Grants": [
+                {
+                    "Grantee": {
+                        "URI": "http://acs.amazonaws.com/groups/s3/LogDelivery",
+                        "Type": "Group"
+                    },
+                    "Permission": "WRITE"
+                }
+            ]
+        })
+    assert err.exception.response["Error"]["Code"] == "MalformedACLError"
+
+    # With incorrect permission:
+    with assert_raises(ClientError) as err:
+        s3.put_bucket_acl(Bucket="bucket", AccessControlPolicy={
+            "Grants": [
+                {
+                    "Grantee": {
+                        "URI": "http://acs.amazonaws.com/groups/s3/LogDelivery",
+                        "Type": "Group"
+                    },
+                    "Permission": "lskjflkasdjflkdsjfalisdjflkdsjf"
+                }
+            ],
+            "Owner": bucket_owner
+        })
+    assert err.exception.response["Error"]["Code"] == "MalformedACLError"
+
+    # Clear the ACLs:
+    result = s3.put_bucket_acl(Bucket="bucket", AccessControlPolicy={"Grants": [], "Owner": bucket_owner})
+    assert not result.get("Grants")
+
+
+@mock_s3
+def test_boto3_put_bucket_logging():
+    s3 = boto3.client("s3", region_name="us-east-1")
+    bucket_name = "mybucket"
+    log_bucket = "logbucket"
+    wrong_region_bucket = "wrongregionlogbucket"
+    s3.create_bucket(Bucket=bucket_name)
+    s3.create_bucket(Bucket=log_bucket)  # Adding the ACL for log-delivery later...
+    s3.create_bucket(Bucket=wrong_region_bucket, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+
+    # No logging config:
+    result = s3.get_bucket_logging(Bucket=bucket_name)
+    assert not result.get("LoggingEnabled")
+
+    # A log-bucket that doesn't exist:
+    with assert_raises(ClientError) as err:
+        s3.put_bucket_logging(Bucket=bucket_name, BucketLoggingStatus={
+            "LoggingEnabled": {
+                "TargetBucket": "IAMNOTREAL",
+                "TargetPrefix": ""
+            }
+        })
+    assert err.exception.response["Error"]["Code"] == "InvalidTargetBucketForLogging"
+
+    # A log-bucket that's missing the proper ACLs for LogDelivery:
+    with assert_raises(ClientError) as err:
+        s3.put_bucket_logging(Bucket=bucket_name, BucketLoggingStatus={
+            "LoggingEnabled": {
+                "TargetBucket": log_bucket,
+                "TargetPrefix": ""
+            }
+        })
+    assert err.exception.response["Error"]["Code"] == "InvalidTargetBucketForLogging"
+    assert "log-delivery" in err.exception.response["Error"]["Message"]
+
+    # Add the proper "log-delivery" ACL to the log buckets:
+    bucket_owner = s3.get_bucket_acl(Bucket=log_bucket)["Owner"]
+    for bucket in [log_bucket, wrong_region_bucket]:
+        s3.put_bucket_acl(Bucket=bucket, AccessControlPolicy={
+            "Grants": [
+                {
+                    "Grantee": {
+                        "URI": "http://acs.amazonaws.com/groups/s3/LogDelivery",
+                        "Type": "Group"
+                    },
+                    "Permission": "WRITE"
+                },
+                {
+                    "Grantee": {
+                        "URI": "http://acs.amazonaws.com/groups/s3/LogDelivery",
+                        "Type": "Group"
+                    },
+                    "Permission": "READ_ACP"
+                },
+                {
+                    "Grantee": {
+                        "Type": "CanonicalUser",
+                        "ID": bucket_owner["ID"]
+                    },
+                    "Permission": "FULL_CONTROL"
+                }
+            ],
+            "Owner": bucket_owner
+        })
+
+    # A log-bucket that's in the wrong region:
+    with assert_raises(ClientError) as err:
+        s3.put_bucket_logging(Bucket=bucket_name, BucketLoggingStatus={
+            "LoggingEnabled": {
+                "TargetBucket": wrong_region_bucket,
+                "TargetPrefix": ""
+            }
+        })
+    assert err.exception.response["Error"]["Code"] == "CrossLocationLoggingProhibitted"
+
+    # Correct logging:
+    s3.put_bucket_logging(Bucket=bucket_name, BucketLoggingStatus={
+        "LoggingEnabled": {
+            "TargetBucket": log_bucket,
+            "TargetPrefix": "{}/".format(bucket_name)
+        }
+    })
+    result = s3.get_bucket_logging(Bucket=bucket_name)
+    assert result["LoggingEnabled"]["TargetBucket"] == log_bucket
+    assert result["LoggingEnabled"]["TargetPrefix"] == "{}/".format(bucket_name)
+    assert not result["LoggingEnabled"].get("TargetGrants")
+
+    # And disabling:
+    s3.put_bucket_logging(Bucket=bucket_name, BucketLoggingStatus={})
+    assert not s3.get_bucket_logging(Bucket=bucket_name).get("LoggingEnabled")
+
+    # And enabling with multiple target grants:
+    s3.put_bucket_logging(Bucket=bucket_name, BucketLoggingStatus={
+        "LoggingEnabled": {
+            "TargetBucket": log_bucket,
+            "TargetPrefix": "{}/".format(bucket_name),
+            "TargetGrants": [
+                {
+                    "Grantee": {
+                        "ID": "SOMEIDSTRINGHERE9238748923734823917498237489237409123840983274",
+                        "Type": "CanonicalUser"
+                    },
+                    "Permission": "READ"
+                },
+                {
+                    "Grantee": {
+                        "ID": "SOMEIDSTRINGHERE9238748923734823917498237489237409123840983274",
+                        "Type": "CanonicalUser"
+                    },
+                    "Permission": "WRITE"
+                }
+            ]
+        }
+    })
+
+    result = s3.get_bucket_logging(Bucket=bucket_name)
+    assert len(result["LoggingEnabled"]["TargetGrants"]) == 2
+    assert result["LoggingEnabled"]["TargetGrants"][0]["Grantee"]["ID"] == \
+        "SOMEIDSTRINGHERE9238748923734823917498237489237409123840983274"
+
+    # Test with just 1 grant:
+    s3.put_bucket_logging(Bucket=bucket_name, BucketLoggingStatus={
+        "LoggingEnabled": {
+            "TargetBucket": log_bucket,
+            "TargetPrefix": "{}/".format(bucket_name),
+            "TargetGrants": [
+                {
+                    "Grantee": {
+                        "ID": "SOMEIDSTRINGHERE9238748923734823917498237489237409123840983274",
+                        "Type": "CanonicalUser"
+                    },
+                    "Permission": "READ"
+                }
+            ]
+        }
+    })
+    result = s3.get_bucket_logging(Bucket=bucket_name)
+    assert len(result["LoggingEnabled"]["TargetGrants"]) == 1
+
+    # With an invalid grant:
+    with assert_raises(ClientError) as err:
+        s3.put_bucket_logging(Bucket=bucket_name, BucketLoggingStatus={
+            "LoggingEnabled": {
+                "TargetBucket": log_bucket,
+                "TargetPrefix": "{}/".format(bucket_name),
+                "TargetGrants": [
+                    {
+                        "Grantee": {
+                            "ID": "SOMEIDSTRINGHERE9238748923734823917498237489237409123840983274",
+                            "Type": "CanonicalUser"
+                        },
+                        "Permission": "NOTAREALPERM"
+                    }
+                ]
+            }
+        })
+    assert err.exception.response["Error"]["Code"] == "MalformedXML"
+
+
+@mock_s3
 def test_boto3_put_object_tagging():
     s3 = boto3.client('s3', region_name='us-east-1')
     bucket_name = 'mybucket'
@@ -1769,6 +2015,30 @@ def test_boto3_put_object_tagging():
         Tagging={'TagSet': [
             {'Key': 'item1', 'Value': 'foo'},
             {'Key': 'item2', 'Value': 'bar'},
+        ]}
+    )
+
+    resp['ResponseMetadata']['HTTPStatusCode'].should.equal(200)
+
+
+@mock_s3
+def test_boto3_put_object_tagging_with_single_tag():
+    s3 = boto3.client('s3', region_name='us-east-1')
+    bucket_name = 'mybucket'
+    key = 'key-with-tags'
+    s3.create_bucket(Bucket=bucket_name)
+
+    s3.put_object(
+        Bucket=bucket_name,
+        Key=key,
+        Body='test'
+    )
+
+    resp = s3.put_object_tagging(
+        Bucket=bucket_name,
+        Key=key,
+        Tagging={'TagSet': [
+            {'Key': 'item1', 'Value': 'foo'}
         ]}
     )
 
@@ -1841,7 +2111,7 @@ def test_boto3_list_object_versions():
 def test_boto3_delete_markers():
     s3 = boto3.client('s3', region_name='us-east-1')
     bucket_name = 'mybucket'
-    key = 'key-with-versions'
+    key = u'key-with-versions-and-unicode-ó'
     s3.create_bucket(Bucket=bucket_name)
     s3.put_bucket_versioning(
         Bucket=bucket_name,
@@ -1856,10 +2126,9 @@ def test_boto3_delete_markers():
             Key=key,
             Body=body
         )
-    s3.delete_object(
-        Bucket=bucket_name,
-        Key=key
-    )
+
+    s3.delete_objects(Bucket=bucket_name, Delete={'Objects': [{'Key': key}]})
+
     with assert_raises(ClientError) as e:
         s3.get_object(
             Bucket=bucket_name,
@@ -1881,12 +2150,18 @@ def test_boto3_delete_markers():
         Bucket=bucket_name
     )
     response['Versions'].should.have.length_of(2)
-    response['Versions'][-1]['IsLatest'].should.be.true
-    response['Versions'][0]['IsLatest'].should.be.false
-    [(key_metadata['Key'], key_metadata['VersionId'])
-     for key_metadata in response['Versions']].should.equal(
-        [('key-with-versions', '0'), ('key-with-versions', '1')]
-    )
+
+    # We've asserted there is only 2 records so one is newest, one is oldest
+    latest = list(filter(lambda item: item['IsLatest'], response['Versions']))[0]
+    oldest = list(filter(lambda item: not item['IsLatest'], response['Versions']))[0]
+
+    # Double check ordering of version ID's
+    latest['VersionId'].should.equal('1')
+    oldest['VersionId'].should.equal('0')
+
+    # Double check the name is still unicode
+    latest['Key'].should.equal('key-with-versions-and-unicode-ó')
+    oldest['Key'].should.equal('key-with-versions-and-unicode-ó')
 
 
 @mock_s3
@@ -1911,9 +2186,8 @@ def test_get_stream_gzipped():
         Bucket='moto-tests',
         Key='keyname',
     )
-    res = zlib.decompress(obj['Body'].read(), 16+zlib.MAX_WBITS)
+    res = zlib.decompress(obj['Body'].read(), 16 + zlib.MAX_WBITS)
     assert res == payload
-
 
 
 TEST_XML = """\

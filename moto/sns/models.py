@@ -7,6 +7,7 @@ import json
 import boto.sns
 import requests
 import six
+import re
 
 from moto.compat import OrderedDict
 from moto.core import BaseBackend, BaseModel
@@ -15,7 +16,8 @@ from moto.sqs import sqs_backends
 from moto.awslambda import lambda_backends
 
 from .exceptions import (
-    SNSNotFoundError, DuplicateSnsEndpointError, SnsEndpointDisabled, SNSInvalidParameter
+    SNSNotFoundError, DuplicateSnsEndpointError, SnsEndpointDisabled, SNSInvalidParameter,
+    InvalidParameterValue
 )
 from .utils import make_arn_for_topic, make_arn_for_subscription
 
@@ -40,11 +42,11 @@ class Topic(BaseModel):
         self.subscriptions_confimed = 0
         self.subscriptions_deleted = 0
 
-    def publish(self, message):
+    def publish(self, message, subject=None):
         message_id = six.text_type(uuid.uuid4())
         subscriptions, _ = self.sns_backend.list_subscriptions(self.arn)
         for subscription in subscriptions:
-            subscription.publish(message, message_id)
+            subscription.publish(message, message_id, subject=subject)
         return message_id
 
     def get_cfn_attribute(self, attribute_name):
@@ -81,27 +83,27 @@ class Subscription(BaseModel):
         self.attributes = {}
         self.confirmed = False
 
-    def publish(self, message, message_id):
+    def publish(self, message, message_id, subject=None):
         if self.protocol == 'sqs':
             queue_name = self.endpoint.split(":")[-1]
             region = self.endpoint.split(":")[3]
-            enveloped_message = json.dumps(self.get_post_data(message, message_id), sort_keys=True, indent=2, separators=(',', ': '))
+            enveloped_message = json.dumps(self.get_post_data(message, message_id, subject), sort_keys=True, indent=2, separators=(',', ': '))
             sqs_backends[region].send_message(queue_name, enveloped_message)
         elif self.protocol in ['http', 'https']:
-            post_data = self.get_post_data(message, message_id)
+            post_data = self.get_post_data(message, message_id, subject)
             requests.post(self.endpoint, json=post_data)
         elif self.protocol == 'lambda':
             # TODO: support bad function name
             function_name = self.endpoint.split(":")[-1]
             region = self.arn.split(':')[3]
-            lambda_backends[region].send_message(function_name, message)
+            lambda_backends[region].send_message(function_name, message, subject=subject)
 
-    def get_post_data(self, message, message_id):
+    def get_post_data(self, message, message_id, subject):
         return {
             "Type": "Notification",
             "MessageId": message_id,
             "TopicArn": self.topic.arn,
-            "Subject": "my subject",
+            "Subject": subject or "my subject",
             "Message": message,
             "Timestamp": iso_8601_datetime_with_milliseconds(datetime.datetime.utcnow()),
             "SignatureVersion": "1",
@@ -193,9 +195,15 @@ class SNSBackend(BaseBackend):
         self.sms_attributes.update(attrs)
 
     def create_topic(self, name):
-        topic = Topic(name, self)
-        self.topics[topic.arn] = topic
-        return topic
+        fails_constraints = not re.match(r'^[a-zA-Z0-9](?:[A-Za-z0-9_-]{0,253}[a-zA-Z0-9])?$', name)
+        if fails_constraints:
+            raise InvalidParameterValue("Topic names must be made up of only uppercase and lowercase ASCII letters, numbers, underscores, and hyphens, and must be between 1 and 256 characters long.")
+        candidate_topic = Topic(name, self)
+        if candidate_topic.arn in self.topics:
+            return self.topics[candidate_topic.arn]
+        else:
+            self.topics[candidate_topic.arn] = candidate_topic
+            return candidate_topic
 
     def _get_values_nexttoken(self, values_map, next_token=None):
         if next_token is None:
@@ -262,7 +270,7 @@ class SNSBackend(BaseBackend):
 
         try:
             topic = self.get_topic(arn)
-            message_id = topic.publish(message)
+            message_id = topic.publish(message, subject=subject)
         except SNSNotFoundError:
             endpoint = self.get_endpoint(arn)
             message_id = endpoint.publish(message)

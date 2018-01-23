@@ -1,8 +1,32 @@
 Moto Changelog
 ===================
 
-Latest
+1.2.0
 ------
+
+    * Supports filtering AMIs by self
+    * Implemented signal_workflow_execution for SWF
+    * Wired SWF backend to the moto server
+    * Revamped lambda function storage to do versioning
+    * IOT improvements
+    * RDS improvements
+    * Implemented CloudWatch get_metric_statistics
+    * Improved Cloudformation EC2 support
+    * Implemented Cloudformation change_set endpoints
+    
+1.1.25
+-----
+
+    * Implemented Iot and Iot-data
+    * Implemented resource tagging API
+    * EC2 AMIs now have owners
+    * Improve codegen scaffolding
+    * Many small fixes to EC2 support
+    * CloudFormation ELBv2 support
+    * UTF fixes for S3
+    * Implemented SSM get_parameters_by_path
+    * More advanced Dynamodb querying
+
 1.1.24
 -----
 

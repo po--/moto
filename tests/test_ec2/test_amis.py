@@ -8,6 +8,7 @@ import boto3
 import boto.ec2
 import boto3
 from boto.exception import EC2ResponseError, EC2ResponseError
+from botocore.exceptions import ClientError
 
 import sure  # noqa
 
@@ -666,9 +667,18 @@ def test_ami_attribute_error_cases():
     cm.exception.request_id.should_not.be.none
 
 
-"""
-Boto3
-"""
+@mock_ec2
+def test_ami_describe_non_existent():
+    ec2 = boto3.resource('ec2', region_name='us-west-1')
+    # Valid pattern but non-existent id
+    img = ec2.Image('ami-abcd1234')
+    with assert_raises(ClientError):
+        img.load()
+    # Invalid ami pattern
+    img = ec2.Image('not_an_ami_id')
+    with assert_raises(ClientError):
+        img.load()
+
 
 @mock_ec2
 def test_ami_filter_wildcard():
@@ -678,3 +688,34 @@ def test_ami_filter_wildcard():
     filter_result = list(ec2.images.filter(Owners=['111122223333'], Filters=[{'Name':'name', 'Values':['test*']}]))
     assert filter_result == [image]
 
+
+@mock_ec2
+def test_ami_filter_by_owner_id():
+    client = boto3.client('ec2', region_name='us-east-1')
+
+    ubuntu_id = '099720109477'
+
+    ubuntu_images = client.describe_images(Owners=[ubuntu_id])
+    all_images = client.describe_images()
+
+    ubuntu_ids = [ami['OwnerId'] for ami in ubuntu_images['Images']]
+    all_ids = [ami['OwnerId'] for ami in all_images['Images']]
+
+    # Assert all ubuntu_ids are the same and one equals ubuntu_id
+    assert all(ubuntu_ids) and ubuntu_ids[0] == ubuntu_id
+    # Check we actually have a subset of images
+    assert len(ubuntu_ids) < len(all_ids)
+
+@mock_ec2
+def test_ami_filter_by_self():
+    client = boto3.client('ec2', region_name='us-east-1')
+
+    my_images = client.describe_images(Owners=['self'])
+    assert len(my_images) == 0
+
+    # Create a new image
+    instance = ec2.create_instances(ImageId='ami-1234abcd', MinCount=1, MaxCount=1)[0]
+    image = instance.create_image(Name='test-image')
+
+    my_images = client.describe_images(Owners=['self'])
+    assert len(my_images) == 1

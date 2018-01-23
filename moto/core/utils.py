@@ -18,6 +18,8 @@ def camelcase_to_underscores(argument):
     python underscore variable like the_new_attribute'''
     result = ''
     prev_char_title = True
+    if not argument:
+        return argument
     for index, char in enumerate(argument):
         try:
             next_char_title = argument[index + 1].istitle()
@@ -272,9 +274,6 @@ def amzn_request_id(f):
             else:
                 status, new_headers, body = response
             headers.update(new_headers)
-            # Cast status to string
-            if "status" in headers:
-                headers['status'] = str(headers['status'])
 
         request_id = gen_amzn_requestid_long(headers)
 

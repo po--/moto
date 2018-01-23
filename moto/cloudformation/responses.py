@@ -4,6 +4,7 @@ import json
 from six.moves.urllib.parse import urlparse
 
 from moto.core.responses import BaseResponse
+from moto.core.utils import amzn_request_id
 from moto.s3 import s3_backend
 from .models import cloudformation_backends
 from .exceptions import ValidationError
@@ -19,10 +20,19 @@ class CloudFormationResponse(BaseResponse):
         template_url_parts = urlparse(template_url)
         if "localhost" in template_url:
             bucket_name, key_name = template_url_parts.path.lstrip(
-                "/").split("/")
+                "/").split("/", 1)
         else:
-            bucket_name = template_url_parts.netloc.split(".")[0]
-            key_name = template_url_parts.path.lstrip("/")
+            if template_url_parts.netloc.endswith('amazonaws.com') \
+                    and template_url_parts.netloc.startswith('s3'):
+                # Handle when S3 url uses amazon url with bucket in path
+                # Also handles getting region as technically s3 is region'd
+
+                # region = template_url.netloc.split('.')[1]
+                bucket_name, key_name = template_url_parts.path.lstrip(
+                    "/").split("/", 1)
+            else:
+                bucket_name = template_url_parts.netloc.split(".")[0]
+                key_name = template_url_parts.path.lstrip("/")
 
         key = s3_backend.get_key(bucket_name, key_name)
         return key.value.decode("utf-8")
@@ -67,6 +77,64 @@ class CloudFormationResponse(BaseResponse):
         else:
             template = self.response_template(CREATE_STACK_RESPONSE_TEMPLATE)
             return template.render(stack=stack)
+
+    @amzn_request_id
+    def create_change_set(self):
+        stack_name = self._get_param('StackName')
+        change_set_name = self._get_param('ChangeSetName')
+        stack_body = self._get_param('TemplateBody')
+        template_url = self._get_param('TemplateURL')
+        role_arn = self._get_param('RoleARN')
+        update_or_create = self._get_param('ChangeSetType', 'CREATE')
+        parameters_list = self._get_list_prefix("Parameters.member")
+        tags = {tag[0]: tag[1] for tag in self._get_list_prefix("Tags.member")}
+        parameters = {param['parameter_key']: param['parameter_value']
+                      for param in parameters_list}
+        if template_url:
+            stack_body = self._get_stack_from_s3_url(template_url)
+        stack_notification_arns = self._get_multi_param(
+            'NotificationARNs.member')
+        change_set_id, stack_id = self.cloudformation_backend.create_change_set(
+            stack_name=stack_name,
+            change_set_name=change_set_name,
+            template=stack_body,
+            parameters=parameters,
+            region_name=self.region,
+            notification_arns=stack_notification_arns,
+            tags=tags,
+            role_arn=role_arn,
+            change_set_type=update_or_create,
+        )
+        if self.request_json:
+            return json.dumps({
+                'CreateChangeSetResponse': {
+                    'CreateChangeSetResult': {
+                        'Id': change_set_id,
+                        'StackId': stack_id,
+                    }
+                }
+            })
+        else:
+            template = self.response_template(CREATE_CHANGE_SET_RESPONSE_TEMPLATE)
+            return template.render(stack_id=stack_id, change_set_id=change_set_id)
+
+    @amzn_request_id
+    def execute_change_set(self):
+        stack_name = self._get_param('StackName')
+        change_set_name = self._get_param('ChangeSetName')
+        self.cloudformation_backend.execute_change_set(
+            stack_name=stack_name,
+            change_set_name=change_set_name,
+        )
+        if self.request_json:
+            return json.dumps({
+                'ExecuteChangeSetResponse': {
+                    'ExecuteChangeSetResult': {},
+                }
+            })
+        else:
+            template = self.response_template(EXECUTE_CHANGE_SET_RESPONSE_TEMPLATE)
+            return template.render()
 
     def describe_stacks(self):
         stack_name_or_id = None
@@ -152,11 +220,15 @@ class CloudFormationResponse(BaseResponse):
     def update_stack(self):
         stack_name = self._get_param('StackName')
         role_arn = self._get_param('RoleARN')
+        template_url = self._get_param('TemplateURL')
         if self._get_param('UsePreviousTemplate') == "true":
             stack_body = self.cloudformation_backend.get_stack(
                 stack_name).template
+        elif template_url:
+            stack_body = self._get_stack_from_s3_url(template_url)
         else:
             stack_body = self._get_param('TemplateBody')
+
         parameters = dict([
             (parameter['parameter_key'], parameter['parameter_value'])
             for parameter
@@ -227,14 +299,35 @@ CREATE_STACK_RESPONSE_TEMPLATE = """<CreateStackResponse>
 </CreateStackResponse>
 """
 
-UPDATE_STACK_RESPONSE_TEMPLATE = """<UpdateStackResponse>
+UPDATE_STACK_RESPONSE_TEMPLATE = """<UpdateStackResponse xmlns="http://cloudformation.amazonaws.com/doc/2010-05-15/">
   <UpdateStackResult>
     <StackId>{{ stack.stack_id }}</StackId>
   </UpdateStackResult>
   <ResponseMetadata>
-    <RequestId>b9b5b068-3a41-11e5-94eb-example</RequestId>
-    </ResponseMetadata>
+    <RequestId>b9b4b068-3a41-11e5-94eb-example</RequestId>
+  </ResponseMetadata>
 </UpdateStackResponse>
+"""
+
+CREATE_CHANGE_SET_RESPONSE_TEMPLATE = """<CreateStackResponse>
+  <CreateChangeSetResult>
+    <Id>{{change_set_id}}</Id>
+    <StackId>{{ stack_id }}</StackId>
+  </CreateChangeSetResult>
+  <ResponseMetadata>
+    <RequestId>{{ request_id }}</RequestId>
+  </ResponseMetadata>
+</CreateStackResponse>
+"""
+
+EXECUTE_CHANGE_SET_RESPONSE_TEMPLATE = """<ExecuteChangeSetResponse>
+  <ExecuteChangeSetResult>
+      <ExecuteChangeSetResult/>
+  </ExecuteChangeSetResult>
+  <ResponseMetadata>
+    <RequestId>{{ request_id }}</RequestId>
+  </ResponseMetadata>
+</ExecuteChangeSetResponse>
 """
 
 DESCRIBE_STACKS_TEMPLATE = """<DescribeStacksResponse>
@@ -399,22 +492,13 @@ GET_TEMPLATE_RESPONSE_TEMPLATE = """<GetTemplateResponse>
 </GetTemplateResponse>"""
 
 
-UPDATE_STACK_RESPONSE_TEMPLATE = """<UpdateStackResponse xmlns="http://cloudformation.amazonaws.com/doc/2010-05-15/">
-  <UpdateStackResult>
-    <StackId>{{ stack.stack_id }}</StackId>
-  </UpdateStackResult>
-  <ResponseMetadata>
-    <RequestId>b9b4b068-3a41-11e5-94eb-example</RequestId>
-  </ResponseMetadata>
-</UpdateStackResponse>
-"""
-
 DELETE_STACK_RESPONSE_TEMPLATE = """<DeleteStackResponse>
   <ResponseMetadata>
     <RequestId>5ccc7dcd-744c-11e5-be70-example</RequestId>
   </ResponseMetadata>
 </DeleteStackResponse>
 """
+
 
 LIST_EXPORTS_RESPONSE = """<ListExportsResponse xmlns="http://cloudformation.amazonaws.com/doc/2010-05-15/">
   <ListExportsResult>

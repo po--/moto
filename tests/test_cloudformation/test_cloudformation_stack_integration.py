@@ -752,6 +752,9 @@ def test_vpc_single_instance_in_subnet():
     security_group.vpc_id.should.equal(vpc.id)
 
     stack = conn.describe_stacks()[0]
+
+    vpc.tags.should.have.key('Application').which.should.equal(stack.stack_id)
+
     resources = stack.describe_resources()
     vpc_resource = [
         resource for resource in resources if resource.resource_type == 'AWS::EC2::VPC'][0]
@@ -891,19 +894,25 @@ def test_iam_roles():
 
             "my-launch-config": {
                 "Properties": {
-                    "IamInstanceProfile": {"Ref": "my-instance-profile"},
+                    "IamInstanceProfile": {"Ref": "my-instance-profile-with-path"},
                     "ImageId": "ami-1234abcd",
                 },
                 "Type": "AWS::AutoScaling::LaunchConfiguration"
             },
-            "my-instance-profile": {
+            "my-instance-profile-with-path": {
                 "Properties": {
                     "Path": "my-path",
-                    "Roles": [{"Ref": "my-role"}],
+                    "Roles": [{"Ref": "my-role-with-path"}],
                 },
                 "Type": "AWS::IAM::InstanceProfile"
             },
-            "my-role": {
+            "my-instance-profile-no-path": {
+                "Properties": {
+                    "Roles": [{"Ref": "my-role-no-path"}],
+                },
+                "Type": "AWS::IAM::InstanceProfile"
+            },
+            "my-role-with-path": {
                 "Properties": {
                     "AssumeRolePolicyDocument": {
                         "Statement": [
@@ -961,6 +970,26 @@ def test_iam_roles():
                     ]
                 },
                 "Type": "AWS::IAM::Role"
+            },
+            "my-role-no-path": {
+                "Properties": {
+                    "AssumeRolePolicyDocument": {
+                        "Statement": [
+                            {
+                                "Action": [
+                                    "sts:AssumeRole"
+                                ],
+                                "Effect": "Allow",
+                                "Principal": {
+                                    "Service": [
+                                        "ec2.amazonaws.com"
+                                    ]
+                                }
+                            }
+                        ]
+                    },
+                },
+                "Type": "AWS::IAM::Role"
             }
         }
     }
@@ -974,37 +1003,51 @@ def test_iam_roles():
 
     iam_conn = boto.iam.connect_to_region("us-west-1")
 
-    role_result = iam_conn.list_roles()['list_roles_response'][
-        'list_roles_result']['roles'][0]
-    role = iam_conn.get_role(role_result.role_name)
-    role.role_name.should.contain("my-role")
-    role.path.should.equal("my-path")
+    role_results = iam_conn.list_roles()['list_roles_response'][
+        'list_roles_result']['roles']
+    role_name_to_id = {}
+    for role_result in role_results:
+        role = iam_conn.get_role(role_result.role_name)
+        role.role_name.should.contain("my-role")
+        if 'with-path' in role.role_name:
+            role_name_to_id['with-path'] = role.role_id
+            role.path.should.equal("my-path")
+        else:
+            role_name_to_id['no-path'] = role.role_id
+            role.role_name.should.contain('no-path')
+            role.path.should.equal('/')
 
-    instance_profile_response = iam_conn.list_instance_profiles()[
-        'list_instance_profiles_response']
-    cfn_instance_profile = instance_profile_response[
-        'list_instance_profiles_result']['instance_profiles'][0]
-    instance_profile = iam_conn.get_instance_profile(
-        cfn_instance_profile.instance_profile_name)
-    instance_profile.instance_profile_name.should.contain(
-        "my-instance-profile")
-    instance_profile.path.should.equal("my-path")
-    instance_profile.role_id.should.equal(role.role_id)
+    instance_profile_responses = iam_conn.list_instance_profiles()[
+        'list_instance_profiles_response']['list_instance_profiles_result']['instance_profiles']
+    instance_profile_responses.should.have.length_of(2)
+    instance_profile_names = []
+
+    for instance_profile_response in instance_profile_responses:
+        instance_profile = iam_conn.get_instance_profile(instance_profile_response.instance_profile_name)
+        instance_profile_names.append(instance_profile.instance_profile_name)
+        instance_profile.instance_profile_name.should.contain(
+            "my-instance-profile")
+        if "with-path" in instance_profile.instance_profile_name:
+            instance_profile.path.should.equal("my-path")
+            instance_profile.role_id.should.equal(role_name_to_id['with-path'])
+        else:
+            instance_profile.instance_profile_name.should.contain('no-path')
+            instance_profile.role_id.should.equal(role_name_to_id['no-path'])
+            instance_profile.path.should.equal('/')
 
     autoscale_conn = boto.ec2.autoscale.connect_to_region("us-west-1")
     launch_config = autoscale_conn.get_all_launch_configurations()[0]
-    launch_config.instance_profile_name.should.contain("my-instance-profile")
+    launch_config.instance_profile_name.should.contain("my-instance-profile-with-path")
 
     stack = conn.describe_stacks()[0]
     resources = stack.describe_resources()
-    instance_profile_resource = [
-        resource for resource in resources if resource.resource_type == 'AWS::IAM::InstanceProfile'][0]
-    instance_profile_resource.physical_resource_id.should.equal(
-        instance_profile.instance_profile_name)
+    instance_profile_resources = [
+        resource for resource in resources if resource.resource_type == 'AWS::IAM::InstanceProfile']
+    {ip.physical_resource_id for ip in instance_profile_resources}.should.equal(set(instance_profile_names))
 
-    role_resource = [
-        resource for resource in resources if resource.resource_type == 'AWS::IAM::Role'][0]
-    role_resource.physical_resource_id.should.equal(role.role_id)
+    role_resources = [
+        resource for resource in resources if resource.resource_type == 'AWS::IAM::Role']
+    {r.physical_resource_id for r in role_resources}.should.equal(set(role_name_to_id.values()))
 
 
 @mock_ec2_deprecated()
@@ -2128,6 +2171,10 @@ def test_stack_elbv2_resources_integration():
                 "Description": "Load balancer name",
                 "Value": {"Fn::GetAtt": ["alb", "LoadBalancerName"]},
             },
+            "canonicalhostedzoneid": {
+                "Description": "Load balancer canonical hosted zone ID",
+                "Value": {"Fn::GetAtt": ["alb", "CanonicalHostedZoneID"]},
+            },
         },
         "Resources": {
             "alb": {
@@ -2145,7 +2192,7 @@ def test_stack_elbv2_resources_integration():
                         "IpAddressType": "ipv4",
                   }
             },
-            "mytargetgroup": {
+            "mytargetgroup1": {
                 "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
                 "Properties": {
                     "HealthCheckIntervalSeconds": 30,
@@ -2158,7 +2205,7 @@ def test_stack_elbv2_resources_integration():
                     "Matcher": {
                         "HttpCode": "200,201"
                     },
-                    "Name": "mytargetgroup",
+                    "Name": "mytargetgroup1",
                     "Port": 80,
                     "Protocol": "HTTP",
                     "TargetType": "instance",
@@ -2173,12 +2220,37 @@ def test_stack_elbv2_resources_integration():
                     }
                 }
             },
+            "mytargetgroup2": {
+                "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+                "Properties": {
+                    "HealthCheckIntervalSeconds": 30,
+                    "HealthCheckPath": "/status",
+                    "HealthCheckPort": 8080,
+                    "HealthCheckProtocol": "HTTP",
+                    "HealthCheckTimeoutSeconds": 5,
+                    "HealthyThresholdCount": 30,
+                    "UnhealthyThresholdCount": 5,
+                    "Name": "mytargetgroup2",
+                    "Port": 8080,
+                    "Protocol": "HTTP",
+                    "TargetType": "instance",
+                    "Targets": [{
+                        "Id": {
+                            "Ref": "ec2instance",
+                            "Port": 8080,
+                        },
+                    }],
+                    "VpcId": {
+                        "Ref": "myvpc",
+                    }
+                }
+            },
             "listener": {
                 "Type": "AWS::ElasticLoadBalancingV2::Listener",
                 "Properties": {
                     "DefaultActions": [{
                         "Type": "forward",
-                        "TargetGroupArn": {"Ref": "mytargetgroup"}
+                        "TargetGroupArn": {"Ref": "mytargetgroup1"}
                     }],
                     "LoadBalancerArn": {"Ref": "alb"},
                     "Port": "80",
@@ -2232,8 +2304,10 @@ def test_stack_elbv2_resources_integration():
     load_balancers[0]['Type'].should.equal('application')
     load_balancers[0]['IpAddressType'].should.equal('ipv4')
 
-    target_groups = elbv2_conn.describe_target_groups()['TargetGroups']
-    len(target_groups).should.equal(1)
+    target_groups = sorted(
+        elbv2_conn.describe_target_groups()['TargetGroups'],
+        key=lambda tg: tg['TargetGroupName'])  # sort to do comparison with indexes
+    len(target_groups).should.equal(2)
     target_groups[0]['HealthCheckIntervalSeconds'].should.equal(30)
     target_groups[0]['HealthCheckPath'].should.equal('/status')
     target_groups[0]['HealthCheckPort'].should.equal('80')
@@ -2242,10 +2316,23 @@ def test_stack_elbv2_resources_integration():
     target_groups[0]['HealthyThresholdCount'].should.equal(30)
     target_groups[0]['UnhealthyThresholdCount'].should.equal(5)
     target_groups[0]['Matcher'].should.equal({'HttpCode': '200,201'})
-    target_groups[0]['TargetGroupName'].should.equal('mytargetgroup')
+    target_groups[0]['TargetGroupName'].should.equal('mytargetgroup1')
     target_groups[0]['Port'].should.equal(80)
     target_groups[0]['Protocol'].should.equal('HTTP')
     target_groups[0]['TargetType'].should.equal('instance')
+
+    target_groups[1]['HealthCheckIntervalSeconds'].should.equal(30)
+    target_groups[1]['HealthCheckPath'].should.equal('/status')
+    target_groups[1]['HealthCheckPort'].should.equal('8080')
+    target_groups[1]['HealthCheckProtocol'].should.equal('HTTP')
+    target_groups[1]['HealthCheckTimeoutSeconds'].should.equal(5)
+    target_groups[1]['HealthyThresholdCount'].should.equal(30)
+    target_groups[1]['UnhealthyThresholdCount'].should.equal(5)
+    target_groups[1]['Matcher'].should.equal({'HttpCode': '200'})
+    target_groups[1]['TargetGroupName'].should.equal('mytargetgroup2')
+    target_groups[1]['Port'].should.equal(8080)
+    target_groups[1]['Protocol'].should.equal('HTTP')
+    target_groups[1]['TargetType'].should.equal('instance')
 
     listeners = elbv2_conn.describe_listeners(LoadBalancerArn=load_balancers[0]['LoadBalancerArn'])['Listeners']
     len(listeners).should.equal(1)
@@ -2260,7 +2347,9 @@ def test_stack_elbv2_resources_integration():
     # test outputs
     stacks = cfn_conn.describe_stacks(StackName='elb_stack')['Stacks']
     len(stacks).should.equal(1)
-    stacks[0]['Outputs'].should.equal([
-        {'OutputKey': 'albdns', 'OutputValue': load_balancers[0]['DNSName']},
-        {'OutputKey': 'albname', 'OutputValue': load_balancers[0]['LoadBalancerName']},
-    ])
+
+    dns = list(filter(lambda item: item['OutputKey'] == 'albdns', stacks[0]['Outputs']))[0]
+    name = list(filter(lambda item: item['OutputKey'] == 'albname', stacks[0]['Outputs']))[0]
+
+    dns['OutputValue'].should.equal(load_balancers[0]['DNSName'])
+    name['OutputValue'].should.equal(load_balancers[0]['LoadBalancerName'])

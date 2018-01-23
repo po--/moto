@@ -736,6 +736,10 @@ class RDS2Backend(BaseBackend):
 
     def modify_database(self, db_instance_identifier, db_kwargs):
         database = self.describe_databases(db_instance_identifier)[0]
+        if 'new_db_instance_identifier' in db_kwargs:
+            del self.databases[db_instance_identifier]
+            db_instance_identifier = db_kwargs['db_instance_identifier'] = db_kwargs.pop('new_db_instance_identifier')
+            self.databases[db_instance_identifier] = database
         database.update(db_kwargs)
         return database
 
@@ -753,13 +757,13 @@ class RDS2Backend(BaseBackend):
             raise InvalidDBInstanceStateError(db_instance_identifier, 'stop')
         if db_snapshot_identifier:
             self.create_snapshot(db_instance_identifier, db_snapshot_identifier)
-        database.status = 'shutdown'
+        database.status = 'stopped'
         return database
 
     def start_database(self, db_instance_identifier):
         database = self.describe_databases(db_instance_identifier)[0]
         # todo: bunch of different error messages to be generated from this api call
-        if database.status != 'shutdown':
+        if database.status != 'stopped':
             raise InvalidDBInstanceStateError(db_instance_identifier, 'start')
         database.status = 'available'
         return database
